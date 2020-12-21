@@ -107,18 +107,12 @@ impl CommandReaderBuilder {
             .stdout(process::Stdio::piped())
             .stderr(process::Stdio::piped())
             .spawn()?;
-        let stdout = child.stdout.take().unwrap();
         let stderr = if self.async_stderr {
             StderrReader::async(child.stderr.take().unwrap())
         } else {
             StderrReader::sync(child.stderr.take().unwrap())
         };
-        Ok(CommandReader {
-            child: child,
-            stdout: stdout,
-            stderr: stderr,
-            done: false,
-        })
+        Ok(CommandReader { child, stderr })
     }
 
     /// When enabled, the reader will asynchronously read the contents of the
@@ -175,9 +169,7 @@ impl CommandReaderBuilder {
 #[derive(Debug)]
 pub struct CommandReader {
     child: process::Child,
-    stdout: process::ChildStdout,
     stderr: StderrReader,
-    done: bool,
 }
 
 impl CommandReader {
@@ -203,21 +195,32 @@ impl CommandReader {
     }
 }
 
-impl io::Read for CommandReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.done {
-            return Ok(0);
-        }
-        let nread = self.stdout.read(buf)?;
-        if nread == 0 {
-            self.done = true;
-            // Reap the child now that we're done reading. If the command
-            // failed, report stderr as an error.
-            if !self.child.wait()?.success() {
-                return Err(io::Error::from(self.stderr.read_to_end()));
+impl Drop for CommandReader {
+    fn drop(&mut self) {
+        // Dropping stdout closes the underlying file descriptor, which should
+        // cause a well-behaved child process to exit. This is desirable as a
+        // CommandReader can be dropped before its command completes, for
+        // example when running ripgrep with the -z and -l options.
+        drop(self.child.stdout.take());
+        match self.child.wait() {
+            Ok(status) => {
+                if !status.success() {
+                    warn!("{}", self.stderr.read_to_end());
+                }
+            }
+            Err(error) => {
+                warn!("wait() failed while reaping child process: {}", error)
             }
         }
-        Ok(nread)
+    }
+}
+
+impl io::Read for CommandReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // unwrap() can never panic here provided that 1) the child is built
+        // with .stdout(process::Stdio::piped(), and 2) we don't take() stdout
+        // anywhere other than in Drop::drop().
+        self.child.stdout.as_mut().unwrap().read(buf)
     }
 }
 
